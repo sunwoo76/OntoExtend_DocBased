@@ -14,6 +14,17 @@
 
 OntoExtend automatically generates OWL/SHACL ontology fragments from natural-language **competency questions** (CQs) by retrieving semantically relevant elements from existing reference ontologies and prompting an LLM to compose valid Turtle (TTL) output.  The generated fragments reuse classes, properties, and restrictions already defined in the reference ontologies wherever possible, and only mint new concepts when the CQ demands it.
 
+## Document-based extension (this fork)
+
+This fork adds a `doc` command that takes an already parsed document, splits it into chunks, generates grounded competency questions per chunk, and extends (updates) an ontology incrementally, with or without a starting ontology. It also merges fragments into a single working graph, re-indexes changed elements, and supports `--base-iri` and `--max-retries`. See [docs/DOC_PIPELINE.md](docs/DOC_PIPELINE.md) (Korean) and [docs/PLAN.md](docs/PLAN.md).
+
+```bash
+cd "OntoExtend Script"
+python rag-ontoextend.py doc --file ../Dataset/sample_docs/textile_circularity_sample.md \
+  --base-iri http://example.org/doc-extension# --max-retries 2 --run-dir ../runs/doc_empty
+python -m pytest ../tests -q   # offline tests, no API key needed
+```
+
 ## Quick start:
 
 1- Embed your large ontology; each vector represents a class or property. 
