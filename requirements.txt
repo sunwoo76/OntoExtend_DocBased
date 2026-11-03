@@ -4,12 +4,11 @@ helpers==0.2.0
 langchain_huggingface==0.3.1
 numpy==2.3.3
 ollama==0.6.0
-openai==0.27.8
+openai>=1.108.0  # code uses the v1 AsyncOpenAI client
 owlready2==0.48
-pandas==1.5.3
+pandas>=2.3.2  # 1.5.x does not support numpy 2.x
 pydantic==2.12.0
 python-dotenv==1.1.1
-PyYAML==6.0
 PyYAML==6.0.3
 rdflib==7.2.1
 rich==14.1.0

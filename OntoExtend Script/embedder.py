@@ -9,7 +9,8 @@ from tiktoken import get_encoding
 from llm_service import TokenCostTracker
 from abc import ABC, abstractmethod
 
-from langchain_huggingface import HuggingFaceEmbeddings
+# langchain_huggingface is imported lazily in HuggingFaceEmbedder so the OpenAI path
+# does not require the HuggingFace / torch stack to be installed.
 
 
 class EmbeddingTypes:
@@ -66,16 +67,17 @@ class OpenAIEmbedder(Embedder):
     
 class HuggingFaceEmbedder(Embedder):
     def __init__(self, model: str, tracker: TokenCostTracker, normalize: bool = True, batch_size: int = 64) -> None:
+        from langchain_huggingface import HuggingFaceEmbeddings
         embedding_model = HuggingFaceEmbeddings(model_name=model)
         super().__init__(model=embedding_model, tracker=tracker, normalize=normalize, batch_size=batch_size)
         
     async def embed_one(self, text: str) -> np.ndarray:
-        embedding_model: HuggingFaceEmbeddings = self.model
+        embedding_model = self.model
         vec = np.asarray(embedding_model.embed_query(text), dtype="float32")[None, :]
         return self._l2norm(vec)
     
     async def embed_many(self, texts: List[str]) -> List[np.ndarray]:
-        embedding_model: HuggingFaceEmbeddings = self.model
+        embedding_model = self.model
         out: List[np.ndarray] = []
         for i in range(0, len(texts), self.batch_size):
             batch = texts[i : i + self.batch_size]
@@ -136,4 +138,4 @@ def get_embedder(embedder_type: EmbeddingTypes, model: str, tracker: TokenCostTr
     elif corporate_openai_embedder_available and embedder_type == EmbeddingTypes.EMBEDDER_TYPE_CORPORATE_OPENAI:
         return CorporateOpenAIEmbedder(model, tracker, normalize, batch_size)
     else:
-        raise ValueError(f"Unknown EMBEDDER_TYPE: '{embedder_type}'. Supported types are 'openai', 'huggingface', and 'corporate-openai'.")
+        raise ValueError(f"Unknown EMBEDDER_TYPE: '{embedder_type}'. Supported types are 'openai', 'huggingface', and 'corporate-openai'.")

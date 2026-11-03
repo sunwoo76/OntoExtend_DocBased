@@ -9,3 +9,4 @@ __pycache__
 uv.lock
 
 OntoExtend Script/helpers/*
+runs/

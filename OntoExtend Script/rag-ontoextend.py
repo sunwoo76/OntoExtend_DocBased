@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import os
 import re
 import sys
@@ -21,6 +22,7 @@ from tiktoken import get_encoding
 from dotenv import load_dotenv
 from llm_service import TokenCostTracker, get_llm_service
 from embedder import get_embedder
+import doc_pipeline
 
 # ==========================
 # Configuration & Constants
@@ -30,13 +32,16 @@ load_dotenv()  # take environment variables from .env
 
 LLM_SERVICE = os.getenv("LLM_SERVICE", "openai")                    # openai or corporate
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
-LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", 0.7)
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.7))  # env values are strings
 
 EMBEDDER = os.getenv("EMBEDDER", "openai")                          # openai or huggingface
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")    # embedding-3-small
-VECTOR_DIM = os.getenv("VECTOR_DIM", 1536)                              
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", 1536))                              
 
 ENC = get_encoding("cl100k_base")
+
+# Namespace for new elements when neither --base-iri nor a reference default namespace is given.
+DEFAULT_BASE_IRI = "http://example.org/ontoextend#"
 
 STANDARD_PREFIXES: Dict[str, str] = {
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -94,7 +99,7 @@ SYS_PROMPT = (
 USER_TMPL = """
 You are a helpful assistant designed to generate ontologies. You receive a COMPETENCY QUESTION (CQ) and optionally an ONTOLOGY STORY (OS). \n
 
-Based on CQ, which is a requirement for the ontology, and OS, which tells you what the context of the ontology is, your task is generating one ontology (O). The goal is to generate O that models the CQ properly. This means there is a way to write a SPARQL query to extract the answer to this CQ in O.  \n
+{story_block}Based on CQ, which is a requirement for the ontology, and OS, which tells you what the context of the ontology is, your task is generating one ontology (O). The goal is to generate O that models the CQ properly. This means there is a way to write a SPARQL query to extract the answer to this CQ in O.  \n
 
 Reuse the relevant ontology elements provided in the RELEVANT ONTOLOGY ELEMENTS section below whenever possible. These elements come from multiple reference ontologies. Only create new elements if absolutely necessary. In any case, add labels and comments. \n
 
@@ -140,7 +145,7 @@ NOTES:
 
 - Do not use external ontologies. Only build on the ontologies provided in RELEVANT ONTOLOGY ELEMENTS .
 
-- Reuse the namespaces (ontology prefix) used in the RELEVANT ONTOLOGY ELEMENTS whenever possible. Only if none are provided, use the ":" namespace .
+- {namespace_note}
 
 - Create the NodeShape with the same IRI as the Class it shapes, i.e. <ontology-prefix>:<ClassName> a sh:NodeShape .
 
@@ -152,6 +157,41 @@ NOTES:
 
 
 - Do not create any new owl:Ontology statements .
+"""
+
+STORY_TMPL = """ONTOLOGY STORY (OS) -- the source text this CQ was derived from. Use it to understand the context and the intended meaning of the terms, but model only what the CQ needs:
+\"\"\"
+{story}
+\"\"\"
+
+"""
+
+NO_ELEMENTS_TEXT = (
+    "(none yet -- the ontology is empty or nothing relevant was found. Create the needed elements "
+    "in the ':' namespace. Use UpperCamelCase for classes and lowerCamelCase for properties, and give "
+    "each element an rdfs:label and rdfs:comment.)"
+)
+
+NAMESPACE_NOTE_REUSE = (
+    'Reuse the namespaces (ontology prefix) used in the RELEVANT ONTOLOGY ELEMENTS whenever possible. '
+    'Only if none are provided, use the ":" namespace .'
+)
+NAMESPACE_NOTE_BASE = (
+    'Reuse existing elements with their own IRIs, but put every NEW element in the ":" namespace. '
+    'Use UpperCamelCase for classes and lowerCamelCase for properties.'
+)
+
+REPAIR_TMPL = """Your previous answer could not be used because it failed validation.
+
+ERROR:
+{error}
+
+PREVIOUS ANSWER:
+```ttl
+{fragment}
+```
+
+Fix the problem and return the complete corrected ontology fragment (not only the changed lines) in Turtle syntax inside one markdown code block. Keep the same modelling decisions unless the error requires changing them. Use the prefixes given in the original request.
 """
 
 # ==========================
@@ -186,6 +226,19 @@ class Paths:
     @property
     def combined_ttl(self) -> Path:
         return self.cache_dir / "combined_ontology.ttl"
+
+    @property
+    def provenance_csv(self) -> Path:
+        return self.cache_dir / "element_provenance.csv"
+
+    @property
+    def duplicates_csv(self) -> Path:
+        return self.cache_dir / "duplicate_candidates.csv"
+
+    @property
+    def working_ttl(self) -> Path:
+        """Snapshot of the working ontology (reference ontologies + all merged fragments)."""
+        return self.cache_dir / "working_ontology.ttl"
 
     @property
     def individual_dir(self) -> Path:
@@ -224,6 +277,37 @@ class RunLogger:
                     ";".join(e.sub_classes or []),
                 ])
 
+    def _append_rows(self, path: Path, header: List[str], rows: List[List[Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        newfile = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if newfile:
+                w.writerow(header)
+            w.writerows(rows)
+
+    def log_provenance(self, cq_index: Any, basename: str, cq: str, chunk_id: Optional[str],
+                       changes: List[Tuple[str, str, str, str]]) -> None:
+        """changes: (uri, status new|changed, element_type, label)."""
+        ts = datetime.now().isoformat()
+        self._append_rows(
+            self.paths.provenance_csv,
+            ["timestamp", "cq_index", "fragment", "chunk_id", "cq", "uri", "status", "element_type", "label"],
+            [[ts, cq_index, basename, chunk_id or "", cq, uri, status, etype, label]
+             for uri, status, etype, label in changes],
+        )
+
+    def log_duplicates(self, cq_index: Any, basename: str, pairs: List[Tuple[str, str, str]]) -> None:
+        """pairs: (new_uri, existing_uri, normalized_label)."""
+        if not pairs:
+            return
+        ts = datetime.now().isoformat()
+        self._append_rows(
+            self.paths.duplicates_csv,
+            ["timestamp", "cq_index", "fragment", "new_uri", "existing_uri", "normalized_label"],
+            [[ts, cq_index, basename, a, b, lab] for a, b, lab in pairs],
+        )
+
     def log_processing_result(
         self,
         cq_index: int,
@@ -233,6 +317,10 @@ class RunLogger:
         source_ontologies: Dict[str, int],
         processing_time: float,
         error: Optional[str] = None,
+        attempts: int = 1,
+        new_elements: int = 0,
+        changed_elements: int = 0,
+        chunk_id: Optional[str] = None,
     ) -> None:
         self.paths.processing_log_csv.parent.mkdir(parents=True, exist_ok=True)
         newfile = not self.paths.processing_log_csv.exists()
@@ -242,6 +330,7 @@ class RunLogger:
                 w.writerow([
                     "timestamp", "cq_index", "cq", "success", "elements_used",
                     "source_ontologies_used", "processing_time_seconds", "error",
+                    "attempts", "new_elements", "changed_elements", "chunk_id",
                 ])
             sources_str = ";".join([f"{Path(k).stem}:{v}" for k, v in source_ontologies.items()])
             w.writerow([
@@ -253,6 +342,10 @@ class RunLogger:
                 sources_str,
                 f"{processing_time:.2f}",
                 error or "",
+                attempts,
+                new_elements,
+                changed_elements,
+                chunk_id or "",
             ])
 
     def log_final_results(
@@ -392,13 +485,26 @@ class PrefixManager:
                 used.add(p)
         return default_ns, extra_prefixes
 
-    def build_prefix_block(self, ontology_files: List[str]) -> str:
+    def build_prefix_block(self, ontology_files: List[str], base_iri: Optional[str] = None) -> str:
+        """Build the @prefix block given to the LLM.
+
+        ':' is bound to `base_iri` when given, otherwise to the reference ontologies' default
+        namespace, otherwise to DEFAULT_BASE_IRI (so an empty start always has a ':' prefix).
+        When `base_iri` displaces a reference default namespace, that namespace keeps a named
+        prefix ('core', 'core2', ...) so its elements stay addressable.
+        """
         default_ns, extra_prefixes = self.collect_prefixes_from_files(ontology_files)
         lines: List[str] = []
         used: Set[str] = set()
-        if default_ns:
-            lines.append(f"@prefix : <{default_ns}> .")
-            used.add("")
+        colon_ns = base_iri or default_ns or DEFAULT_BASE_IRI
+        lines.append(f"@prefix : <{colon_ns}> .")
+        used.add("")
+        if default_ns and default_ns != colon_ns and default_ns not in extra_prefixes.values():
+            name = "core"
+            while name in extra_prefixes or name in STANDARD_PREFIXES:
+                m = re.search(r"(\d+)$", name)
+                name = re.sub(r"\d+$", str(int(m.group(1)) + 1), name) if m else f"{name}2"
+            extra_prefixes[name] = default_ns
         for pref, uri in REQUIRED_PREFIXES:
             if pref in used:
                 continue
@@ -410,6 +516,10 @@ class PrefixManager:
             lines.append(f"@prefix {pref}: <{extra_prefixes[pref]}> .")
             used.add(pref)
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def parse_prefix_block(prefix_block: str) -> Dict[str, str]:
+        return {m.group(1): m.group(2) for m in re.finditer(r"@prefix\s+([A-Za-z0-9_\-]*):\s*<([^>]*)>", prefix_block)}
 
 
 # ==========================
@@ -468,46 +578,60 @@ class OntologyExtractor:
     def _extract_single(self, ontology_file: str) -> List[OntologyElement]:
         g = Graph()
         g.parse(ontology_file)
+        return self.extract_from_graph(g, ontology_file)
+
+    def extract_from_graph(self, g: Graph, source: str, subjects: Optional[Set[URIRef]] = None) -> List[OntologyElement]:
+        """Extract elements from an in-memory graph; if `subjects` is given, only those IRIs."""
+        def keep(node: Any) -> bool:
+            return subjects is None or node in subjects
+
         elements: List[OntologyElement] = []
+        ontology_file = source
         # classes
         for cls in list(g.subjects(RDF.type, OWL.Class)):
-            if isinstance(cls, URIRef):
+            if isinstance(cls, URIRef) and keep(cls):
                 el = self._extract_class_info(g, cls, ontology_file)
                 if el:
                     elements.append(el)
         # object properties
         for prop in list(g.subjects(RDF.type, OWL.ObjectProperty)):
-            if isinstance(prop, URIRef):
+            if isinstance(prop, URIRef) and keep(prop):
                 el = self._extract_property_info(g, prop, 'object_property', ontology_file)
                 if el:
                     elements.append(el)
         # data properties
         for prop in list(g.subjects(RDF.type, OWL.DatatypeProperty)):
-            if isinstance(prop, URIRef):
+            if isinstance(prop, URIRef) and keep(prop):
                 el = self._extract_property_info(g, prop, 'data_property', ontology_file)
                 if el:
                     elements.append(el)
         # annotation properties
         for prop in list(g.subjects(RDF.type, OWL.AnnotationProperty)):
-            if isinstance(prop, URIRef):
+            if isinstance(prop, URIRef) and keep(prop):
                 el = self._extract_property_info(g, prop, 'annotation_property', ontology_file)
                 if el:
                     elements.append(el)
 
         # SHACL NodeShapes
         for shape in list(g.subjects(RDF.type, SH.NodeShape)):
+            if not keep(shape):
+                continue
             el = self._extract_shacl_shape(g, shape, ontology_file, 'node_shape')
             if el:
                 elements.append(el)
 
         # SHACL PropertyShapes
         for shape in list(g.subjects(RDF.type, SH.PropertyShape)):
+            if not keep(shape):
+                continue
             el = self._extract_shacl_shape(g, shape, ontology_file, 'property_shape')
             if el:
                 elements.append(el)
 
         # Named OWL restrictions (skip blank nodes)
         for restriction in list(g.subjects(RDF.type, OWL.Restriction)):
+            if not keep(restriction):
+                continue
             el = self._extract_named_restriction(g, restriction, ontology_file)
             if el:
                 elements.append(el)
@@ -653,27 +777,244 @@ class OntologyExtractor:
 
 
 class FaissVectorStore:
+    """FAISS inner-product index keyed by element URI.
+
+    Uses IndexIDMap2 so that a URI's vector can be replaced when the element changes
+    (e.g. a later fragment adds axioms to an existing class): `upsert()` swaps the vector
+    and the element in place, `add()` keeps the original insert-once behaviour.
+    """
+
     def __init__(self, dim: int, inner_product: bool = True) -> None:
-        self.idx = faiss.IndexFlatIP(dim) if inner_product else faiss.IndexFlatL2(dim)
-        self.elements: List[OntologyElement] = []
-        self.seen_uris: Set[str] = set()
+        base = faiss.IndexFlatIP(dim) if inner_product else faiss.IndexFlatL2(dim)
+        self.idx = faiss.IndexIDMap2(base)
+        self._by_id: Dict[int, OntologyElement] = {}
+        self._id_by_uri: Dict[str, int] = {}
+        self._next_id = 0
+
+    @property
+    def elements(self) -> List[OntologyElement]:
+        return list(self._by_id.values())
+
+    @property
+    def seen_uris(self) -> Set[str]:
+        return set(self._id_by_uri.keys())
 
     def is_new(self, uri: str) -> bool:
-        return uri not in self.seen_uris
+        return uri not in self._id_by_uri
+
+    def get(self, uri: str) -> Optional[OntologyElement]:
+        i = self._id_by_uri.get(uri)
+        return self._by_id.get(i) if i is not None else None
+
+    def _insert(self, vec: np.ndarray, element: OntologyElement) -> None:
+        i = self._next_id
+        self._next_id += 1
+        self.idx.add_with_ids(np.asarray(vec, dtype="float32").reshape(1, -1), np.array([i], dtype="int64"))
+        self._by_id[i] = element
+        self._id_by_uri[element.uri] = i
 
     def add(self, vec: np.ndarray, element: OntologyElement) -> bool:
-        if not element.uri or element.uri in self.seen_uris:
+        if not element.uri or element.uri in self._id_by_uri:
             return False
-        self.idx.add(vec)
-        self.elements.append(element)
-        self.seen_uris.add(element.uri)
+        self._insert(vec, element)
         return True
+
+    def upsert(self, vec: np.ndarray, element: OntologyElement) -> str:
+        """Insert or replace; returns 'added' or 'updated'."""
+        if not element.uri:
+            return "skipped"
+        old = self._id_by_uri.pop(element.uri, None)
+        if old is not None:
+            self.idx.remove_ids(np.array([old], dtype="int64"))
+            self._by_id.pop(old, None)
+        self._insert(vec, element)
+        return "updated" if old is not None else "added"
 
     def search(self, vec: np.ndarray, k: int = 10) -> List[Tuple[OntologyElement, float]]:
         if self.idx.ntotal == 0:
             return []
-        D, I = self.idx.search(vec, k)
-        return [(self.elements[i], float(D[0][j])) for j, i in enumerate(I[0]) if i != -1]
+        D, I = self.idx.search(np.asarray(vec, dtype="float32").reshape(1, -1), min(k, self.idx.ntotal))
+        return [(self._by_id[int(i)], float(D[0][j])) for j, i in enumerate(I[0]) if i != -1 and int(i) in self._by_id]
+
+
+# ==========================
+# Working ontology (incremental update)
+# ==========================
+
+@dataclass
+class MergeResult:
+    new_subjects: Set[URIRef]
+    changed_subjects: Set[URIRef]
+    added_triples: int
+    duplicate_candidates: List[Tuple[str, str, str]]
+
+
+def _normalize_label(text: str) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+class WorkingOntology:
+    """One rdflib graph that grows with every accepted fragment.
+
+    `base` holds the reference (starting) ontology, `extension` holds only what the
+    fragments added. Merging is done on triples, so a fragment that re-declares an
+    existing class only contributes the axioms that are actually new.
+    """
+
+    def __init__(self, prefix_map: Dict[str, str], ontology_iri: str) -> None:
+        self.prefix_map = prefix_map
+        self.ontology_iri = ontology_iri
+        self.base = Graph()
+        self.extension = Graph()
+        for g in (self.base, self.extension):
+            self._bind(g)
+
+    def _bind(self, g: Graph) -> None:
+        for pref, ns in self.prefix_map.items():
+            g.bind(pref, Namespace(ns), override=True, replace=True)
+
+    def load_base(self, files: List[str]) -> None:
+        for f in files:
+            try:
+                self.base.parse(f)
+            except Exception as e:
+                print(f"[yellow]Could not load {f} into the working ontology: {e}[/yellow]")
+        # remove owl:Ontology headers of the inputs; the outputs get a single header
+        for s in list(self.base.subjects(RDF.type, OWL.Ontology)):
+            self.base.remove((s, None, None))
+        self._bind(self.base)
+
+    def full(self) -> Graph:
+        g = Graph()
+        self._bind(g)
+        for t in self.base:
+            g.add(t)
+        for t in self.extension:
+            g.add(t)
+        return g
+
+    def _labels(self) -> Dict[str, Set[str]]:
+        out: Dict[str, Set[str]] = {}
+        for g in (self.base, self.extension):
+            for s, o in g.subject_objects(RDFS.label):
+                if isinstance(s, URIRef):
+                    out.setdefault(_normalize_label(str(o)), set()).add(str(s))
+            for s in g.subjects(RDF.type, None):
+                if isinstance(s, URIRef):
+                    out.setdefault(_normalize_label(OntologyExtractor._local_name(str(s))), set()).add(str(s))
+        return out
+
+    @staticmethod
+    def _bnode_signature(g: Graph, node: Any, depth: int = 12) -> Any:
+        """Structural signature of a blank-node subtree (restrictions, lists, unions...)."""
+        if not isinstance(node, BNode):
+            return node
+        if depth <= 0:
+            return "..."
+        return tuple(sorted(
+            (str(p), repr(WorkingOntology._bnode_signature(g, o, depth - 1)))
+            for p, o in g.predicate_objects(node)
+        ))
+
+    @staticmethod
+    def _bnode_closure(g: Graph, node: Any) -> Set[BNode]:
+        seen: Set[BNode] = set()
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if not isinstance(n, BNode) or n in seen:
+                continue
+            seen.add(n)
+            stack.extend(o for o in g.objects(n, None))
+        return seen
+
+    def merge(self, fragment: Graph) -> MergeResult:
+        for s in list(fragment.subjects(RDF.type, OWL.Ontology)):
+            fragment.remove((s, None, None))
+        before = self.full()
+        known = set(before.subjects())
+        labels_before = self._labels()
+
+        # Blank-node structures (restrictions etc.) get fresh ids on every parse, so compare
+        # them structurally: a fragment that repeats an existing restriction adds nothing.
+        skip_triples: Set[Tuple[Any, Any, Any]] = set()
+        skip_bnodes: Set[BNode] = set()
+        for s, p, o in fragment:
+            if isinstance(s, URIRef) and isinstance(o, BNode):
+                sig = self._bnode_signature(fragment, o)
+                existing = {self._bnode_signature(before, o2) for o2 in before.objects(s, p) if isinstance(o2, BNode)}
+                if sig in existing:
+                    skip_triples.add((s, p, o))
+                    skip_bnodes |= self._bnode_closure(fragment, o)
+
+        new_subjects: Set[URIRef] = set()
+        changed: Set[URIRef] = set()
+        added = 0
+        added_bnodes: Set[BNode] = set()
+        for t in fragment:
+            if t in skip_triples or t[0] in skip_bnodes or t in before:
+                continue
+            self.extension.add(t)
+            added += 1
+            s = t[0]
+            if isinstance(s, URIRef):
+                (changed if s in known else new_subjects).add(s)
+            elif isinstance(s, BNode):
+                added_bnodes.add(s)
+        # A new blank-node axiom belongs to the named node(s) that point to it.
+        if added_bnodes:
+            full = self.full()
+            for b in added_bnodes:
+                for owner in self._owners(full, b):
+                    if owner not in new_subjects:
+                        (changed if owner in known else new_subjects).add(owner)
+
+        dups: List[Tuple[str, str, str]] = []
+        for s in new_subjects:
+            names = {_normalize_label(OntologyExtractor._local_name(str(s)))}
+            names |= {_normalize_label(str(o)) for o in fragment.objects(s, RDFS.label)}
+            for n in names:
+                for other in labels_before.get(n, set()):
+                    if n and other != str(s):
+                        dups.append((str(s), other, n))
+        return MergeResult(new_subjects, changed, added, sorted(set(dups)))
+
+    @staticmethod
+    def _owners(g: Graph, node: Any, depth: int = 4) -> Set[URIRef]:
+        owners: Set[URIRef] = set()
+        frontier = {node}
+        for _ in range(depth):
+            nxt = set()
+            for n in frontier:
+                for s in g.subjects(None, n):
+                    if isinstance(s, URIRef):
+                        owners.add(s)
+                    elif isinstance(s, BNode):
+                        nxt.add(s)
+            if not nxt:
+                break
+            frontier = nxt
+        return owners
+
+    def _with_header(self, g: Graph, comment: str) -> Graph:
+        onto = URIRef(self.ontology_iri)
+        g.add((onto, RDF.type, OWL.Ontology))
+        g.add((onto, RDFS.comment, Literal(comment)))
+        return g
+
+    def serialize_updated(self, path: Path) -> None:
+        g = self._with_header(self.full(), "Reference ontology extended with fragments generated from competency questions (OntoExtend).")
+        path.write_text(g.serialize(format="turtle"), encoding="utf-8")
+
+    def serialize_extension(self, path: Path, reference_files: List[str], n_fragments: int) -> None:
+        g = Graph()
+        self._bind(g)
+        for t in self.extension:
+            g.add(t)
+        refs = ", ".join(Path(f).name for f in reference_files) or "none (started from an empty ontology)"
+        self._with_header(g, f"Extension only: {n_fragments} merged fragments. Reference ontologies: {refs}.")
+        path.write_text(g.serialize(format="turtle"), encoding="utf-8")
 
 
 # ==========================
@@ -681,8 +1022,9 @@ class FaissVectorStore:
 # ==========================
 
 class PromptBuilder:
-    def __init__(self, prefix_block: str) -> None:
+    def __init__(self, prefix_block: str, new_elements_in_base: bool = False) -> None:
         self.prefix_block = prefix_block
+        self.namespace_note = NAMESPACE_NOTE_BASE if new_elements_in_base else NAMESPACE_NOTE_REUSE
 
     @staticmethod
     def _format_relevant_elements(elements: List[OntologyElement]) -> Tuple[str, int]:
@@ -703,13 +1045,18 @@ class PromptBuilder:
                         parts.append("```")
         return "\n".join(parts), len(elements_by_source)
 
-    def build(self, cq: str, elements: List[OntologyElement]) -> str:
+    def build(self, cq: str, elements: List[OntologyElement], story: Optional[str] = None) -> str:
         relevant_text, num_ontologies = self._format_relevant_elements(elements)
+        if not elements:
+            relevant_text = NO_ELEMENTS_TEXT
+        story_block = STORY_TMPL.format(story=story.strip()) if story and story.strip() else ""
         return USER_TMPL.format(
             num_ontologies=num_ontologies,
             relevant_elements=relevant_text,
             cq=cq,
             prefix_block=self.prefix_block,
+            story_block=story_block,
+            namespace_note=self.namespace_note,
         )
 
 
@@ -729,14 +1076,36 @@ class TurtleValidator:
             return False
 
 
+def parse_fragment(fragment: str, prefix_block: str) -> Tuple[Graph, str]:
+    """Parse an LLM fragment. If it does not parse on its own (typically because it uses
+    prefixes it did not declare), retry with the prompt's prefix block prepended; the
+    fragment's own declarations still win because later @prefix lines override earlier ones.
+    Returns (graph, self-contained Turtle text). Raises ValueError with the parser message."""
+    g = Graph()
+    try:
+        g.parse(data=fragment, format="turtle")
+        return g, fragment
+    except Exception as first:
+        combined = f"{prefix_block}\n{fragment}"
+        g = Graph()
+        try:
+            g.parse(data=combined, format="turtle")
+            return g, combined
+        except Exception:
+            raise ValueError(f"Invalid Turtle: {first}") from first
+
+
 class PropertyConstraintValidator:
     @staticmethod
-    def ensure_domain_range(ttl_content: str) -> None:
-        try:
-            g = Graph()
-            g.parse(data=ttl_content, format="turtle")
-        except Exception as e:
-            raise ValueError(f"Unable to parse TTL for domain/range validation: {e}") from e
+    def ensure_domain_range(ttl_content: Any) -> None:
+        if isinstance(ttl_content, Graph):
+            g = ttl_content
+        else:
+            try:
+                g = Graph()
+                g.parse(data=ttl_content, format="turtle")
+            except Exception as e:
+                raise ValueError(f"Unable to parse TTL for domain/range validation: {e}") from e
 
         issues: List[str] = []
 
@@ -796,6 +1165,16 @@ class OntologyCombiner:
 # RAG Application
 # ==========================
 
+@dataclass
+class CQOutcome:
+    success: bool
+    basename: str
+    attempts: int = 0
+    new_elements: int = 0
+    changed_elements: int = 0
+    error: Optional[str] = None
+
+
 class OntologyRAG:
     def __init__(self, paths: Paths, normalize_vectors: bool = True, batch_size: int = 64) -> None:
         self.paths = paths
@@ -810,6 +1189,13 @@ class OntologyRAG:
         self.reference_sources: Set[str] = set()
         self.session_sources: Set[str] = set()
         self.cache_sources: Set[str] = set()
+        # incremental-update settings (set from the CLI)
+        self.base_iri: Optional[str] = None
+        self.max_retries: int = 0
+        self.ontology_files: List[str] = []
+        self.prefix_block: str = ""
+        self.working: Optional[WorkingOntology] = None
+        self.fragments: List[Tuple[str, str]] = []
 
     @staticmethod
     def _resolve_path(path: str) -> str:
@@ -833,7 +1219,7 @@ class OntologyRAG:
 
     def _core_tag(self, ontology_files: List[str]) -> str:
         if not ontology_files:
-            return "core"
+            return "empty"
         stems = sorted({Path(f).stem for f in ontology_files})
         combined = "-".join(stems)
         return self._sanitize_token(combined, "core")
@@ -859,13 +1245,22 @@ class OntologyRAG:
                     return value
         return None
 
-    def _write_retrieved_elements(self, basename: str, elements: List[OntologyElement]) -> None:
+    @staticmethod
+    def _extract_story(row: pd.Series) -> Optional[str]:
+        for col in ("Story", "story", "OS", "context", "Context"):
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                return str(row[col]).strip()
+        return None
+
+    def _write_retrieved_elements(self, basename: str, scored: List[Tuple[OntologyElement, float]]) -> None:
         out_path = self.paths.retrieved_dir / f"{basename}_retrieved.csv"
         with out_path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["uri", "element_type", "source", "label", "domains", "ranges", "notes"])
-            for el in elements:
+            writer.writerow(["rank", "score", "uri", "element_type", "source", "label", "domains", "ranges", "notes"])
+            for rank, (el, score) in enumerate(scored, 1):
                 writer.writerow([
+                    rank,
+                    f"{score:.6f}",
                     el.uri,
                     el.element_type,
                     Path(el.source_ontology).stem,
@@ -884,6 +1279,29 @@ class OntologyRAG:
         vecs = await self.embedder.embed_many(texts)
         for vec, element in zip(vecs, new_elements):
             self.store.add(vec, element)
+
+    async def _upsert_elements(self, elements: List[OntologyElement]) -> Tuple[int, int]:
+        """Insert new elements and re-embed changed ones. One element per URI (first wins,
+        so an IRI that is both owl:Class and sh:NodeShape is indexed as the class)."""
+        unique: Dict[str, OntologyElement] = {}
+        for e in elements:
+            if e.uri and e.uri not in unique:
+                existing = self.store.get(e.uri)
+                if existing is not None:
+                    # keep the element listed under the ontology it came from
+                    e = e.model_copy(update={"source_ontology": existing.source_ontology})
+                unique[e.uri] = e
+        if not unique:
+            return 0, 0
+        items = list(unique.values())
+        vecs = await self.embedder.embed_many([e.get_searchable_text() for e in items])
+        added = updated = 0
+        for vec, element in zip(vecs, items):
+            if self.store.upsert(vec, element) == "updated":
+                updated += 1
+            else:
+                added += 1
+        return added, updated
 
     async def _index_additional_files(self, files: List[str], *, origin: Literal["cache", "session"]) -> None:
         if not files:
@@ -907,70 +1325,158 @@ class OntologyRAG:
         print(f"[yellow]Loading {len(cache_files)} cached CQ fragments into the vector store...[/yellow]")
         await self._index_additional_files([str(f) for f in cache_files], origin="cache")
 
-    # @staticmethod
-    # def ensure_api_key() -> None:
-    #     if not os.getenv("OPENAI_API_KEY"):
-    #         print("[bold red]OPENAI_API_KEY is not set[/bold red]")
-    #         sys.exit(1)
-
     async def _build_store(self, ontology_files: List[str]) -> str:
-        print("[yellow]Building vector store from reference ontologies...[/yellow]")
+        if ontology_files:
+            print("[yellow]Building vector store from reference ontologies...[/yellow]")
+        else:
+            print("[yellow]No reference ontology: starting from an empty ontology[/yellow]")
         self.reference_sources = {self._resolve_path(f) for f in ontology_files}
-        self.session_sources.clear()
+        self.session_sources = {self._resolve_path(str(self.paths.working_ttl))}
         if not self.include_cache:
             self.cache_sources.clear()
-        elements = self.extractor.extract_from_files(ontology_files)
+        elements = self.extractor.extract_from_files(ontology_files) if ontology_files else []
         await self._index_elements(elements)
         await self._index_existing_fragments()
-        prefix_block = self.prefix_mgr.build_prefix_block(ontology_files)
+        prefix_block = self.prefix_mgr.build_prefix_block(ontology_files, base_iri=self.base_iri)
         print(f"[green]Indexed {len(self.store.elements)} ontology elements from {len(ontology_files)} ontologies[/green]")
         return prefix_block
 
-    async def _retrieve_relevant(self, cq: str, k: int = 20) -> List[OntologyElement]:
+    async def prepare(self, ontology_files: List[str]) -> None:
+        """Index the starting ontology (may be empty) and set up the working graph."""
+        self.ontology_files = list(ontology_files)
+        self.prefix_block = await self._build_store(ontology_files)
+        prefix_map = self.prefix_mgr.parse_prefix_block(self.prefix_block)
+        colon = prefix_map.get("", DEFAULT_BASE_IRI)
+        onto_iri = colon.rstrip("#/") or "http://example.org/ontoextend"
+        self.working = WorkingOntology(prefix_map, onto_iri)
+        self.working.load_base(ontology_files)
+        self.fragments = []
+
+    async def _retrieve_scored(self, cq: str, k: int = 20) -> List[Tuple[OntologyElement, float]]:
         qvec = await self.embedder.embed_one(cq)
         results = self.store.search(qvec, k)
         allowed_sources = self._allowed_sources()
-        filtered: List[OntologyElement] = []
-        for el, _ in results:
-            src = self._resolve_path(el.source_ontology)
-            if src in allowed_sources:
-                filtered.append(el)
-        return filtered
+        return [(el, sc) for el, sc in results if self._resolve_path(el.source_ontology) in allowed_sources]
 
-    async def _generate_fragment(self, cq: str, relevant: List[OntologyElement], prefix_block: str) -> str:
-        prompt = PromptBuilder(prefix_block).build(cq, relevant)
-        response = await self.llm.complete(prompt, system_prompt=SYS_PROMPT)
-        m = re.search(r"```(?:ttl|turtle)?\n(.*?)```", response, re.DOTALL)
+    async def _retrieve_relevant(self, cq: str, k: int = 20) -> List[OntologyElement]:
+        return [el for el, _ in await self._retrieve_scored(cq, k)]
+
+    @staticmethod
+    def _extract_ttl(response: str) -> str:
+        m = re.search(r"```(?:ttl|turtle)?\s*\n(.*?)```", response, re.DOTALL)
         return (m.group(1).strip() if m else response.strip())
 
-    async def run_single_cq(self, cq: str, ontology_files: List[str], top_k: int = 20) -> None:
-        prefix_block = await self._build_store(ontology_files)
+    async def _generate_fragment(self, cq: str, relevant: List[OntologyElement], prefix_block: str,
+                                 story: Optional[str] = None) -> str:
+        prompt = PromptBuilder(prefix_block, new_elements_in_base=bool(self.base_iri)).build(cq, relevant, story)
+        response = await self.llm.complete(prompt, system_prompt=SYS_PROMPT)
+        return self._extract_ttl(response)
+
+    async def _generate_valid_fragment(self, cq: str, relevant: List[OntologyElement],
+                                       story: Optional[str]) -> Tuple[Graph, str, int]:
+        """Generate, parse and check a fragment; on failure feed the error back to the LLM up
+        to `max_retries` times. Returns (graph, self-contained TTL, attempts)."""
+        prompt = PromptBuilder(self.prefix_block, new_elements_in_base=bool(self.base_iri)).build(cq, relevant, story)
+        response = await self.llm.complete(prompt, system_prompt=SYS_PROMPT)
+        attempts = 1
+        while True:
+            fragment = self._extract_ttl(response)
+            try:
+                g, text = parse_fragment(fragment, self.prefix_block)
+                PropertyConstraintValidator.ensure_domain_range(g)
+                if len(g) == 0:
+                    raise ValueError("Empty fragment: no triples were generated")
+                return g, text, attempts
+            except ValueError as err:
+                if attempts > self.max_retries:
+                    raise
+                print(f"[yellow]Attempt {attempts} failed ({err}); asking the LLM to repair[/yellow]")
+                repair = prompt + "\n\n" + REPAIR_TMPL.format(error=str(err)[:2000], fragment=fragment)
+                response = await self.llm.complete(repair, system_prompt=SYS_PROMPT)
+                attempts += 1
+
+    async def process_cq(self, cq: str, basename: str, *, cq_index: Any, top_k: int = 20,
+                         story: Optional[str] = None, chunk_id: Optional[str] = None) -> CQOutcome:
+        """Retrieve -> generate (with optional repair) -> merge into the working ontology ->
+        re-index new and changed elements. Requires `prepare()`."""
+        assert self.working is not None, "call prepare() first"
+        start = time.time()
+        before = self.tracker.snapshot()
+        scored: List[Tuple[OntologyElement, float]] = []
+        src_counts: Dict[str, int] = {}
+        outcome = CQOutcome(False, basename)
+        try:
+            scored = await self._retrieve_scored(cq, k=top_k)
+            relevant = [el for el, _ in scored]
+            self._write_retrieved_elements(basename, scored)
+            for el in relevant:
+                key = Path(el.source_ontology).stem
+                src_counts[key] = src_counts.get(key, 0) + 1
+
+            g, text, attempts = await self._generate_valid_fragment(cq, relevant, story)
+            outcome.attempts = attempts
+            out_file = self.paths.individual_dir / f"{basename}.ttl"
+            out_file.write_text(text, encoding="utf-8")
+
+            merge = self.working.merge(g)
+            touched = merge.new_subjects | merge.changed_subjects
+            full = self.working.full()
+            elements = self.extractor.extract_from_graph(full, str(self.paths.working_ttl), subjects=touched)
+            await self._upsert_elements(elements)
+            types = {e.uri: e for e in elements}
+            changes = [(str(u), "new", types[str(u)].element_type if str(u) in types else "", types[str(u)].label or "" if str(u) in types else "")
+                       for u in sorted(merge.new_subjects)]
+            changes += [(str(u), "changed", types[str(u)].element_type if str(u) in types else "", types[str(u)].label or "" if str(u) in types else "")
+                        for u in sorted(merge.changed_subjects)]
+            self.logger.log_provenance(cq_index, basename, cq, chunk_id, changes)
+            self.logger.log_duplicates(cq_index, basename, merge.duplicate_candidates)
+            self.paths.working_ttl.write_text(full.serialize(format="turtle"), encoding="utf-8")
+            self.fragments.append((cq, text))
+
+            outcome.success = True
+            outcome.new_elements = len(merge.new_subjects)
+            outcome.changed_elements = len(merge.changed_subjects)
+            print(f"[green]{basename}: merged {merge.added_triples} triples "
+                  f"({outcome.new_elements} new, {outcome.changed_elements} changed elements)[/green]")
+        except ValueError as err:
+            outcome.error = str(err)
+            outcome.attempts = outcome.attempts or (self.max_retries + 1)
+            print(f"[red]{basename}: {err}[/red]")
+        except Exception as e:
+            outcome.error = f"{type(e).__name__}: {e}"
+            print(f"[red]{basename} failed: {outcome.error}[/red]")
+        finally:
+            self.logger.log_processing_result(
+                cq_index, cq, outcome.success, len(scored), src_counts, time.time() - start,
+                outcome.error, attempts=outcome.attempts, new_elements=outcome.new_elements,
+                changed_elements=outcome.changed_elements, chunk_id=chunk_id,
+            )
+            self.logger.log_cost_row(cq_index, cq, self.tracker.diff(before, self.tracker.snapshot()))
+        return outcome
+
+    def finalize(self, tag: str) -> Optional[Path]:
+        """Write <tag>_combined.ttl (extension only) and <tag>_updated.ttl (start + extension)."""
+        assert self.working is not None
+        if not self.fragments:
+            return None
+        combined_path = self.paths.cache_dir / f"{tag}_combined.ttl"
+        updated_path = self.paths.cache_dir / f"{tag}_updated.ttl"
+        self.working.serialize_extension(combined_path, self.ontology_files, len(self.fragments))
+        self.working.serialize_updated(updated_path)
+        for pth in (combined_path, updated_path):
+            ok = TurtleValidator.validate_ttl(pth.read_text(encoding="utf-8"))
+            print(f"[green]Saved {pth} ({'valid' if ok else 'INVALID'} Turtle)[/green]")
+        return combined_path
+
+    async def run_single_cq(self, cq: str, ontology_files: List[str], top_k: int = 20, story: Optional[str] = None) -> None:
+        await self.prepare(ontology_files)
         onto_tag = self._core_tag(ontology_files)
         basename = self._build_cq_basename(None, 1, onto_tag)
-        before = self.tracker.snapshot()
-        relevant = await self._retrieve_relevant(cq, k=top_k)
-        self._write_retrieved_elements(basename, relevant)
-        try:
-            fragment = await self._generate_fragment(cq, relevant, prefix_block)
-            PropertyConstraintValidator.ensure_domain_range(fragment)
-        except ValueError as err:
-            print(f"[red]{err}[/red]")
-            after = self.tracker.snapshot()
-            self.logger.log_cost_row(-1, cq, self.tracker.diff(before, after))
-            return
-        # validate & write
-        if TurtleValidator.validate_ttl(fragment):
-            out_path = self.paths.individual_dir / f"{basename}.ttl"
-            out_path.write_text(fragment, encoding="utf-8")
-            await self._index_additional_files([str(out_path)], origin="session")
-            print(f"[green]Ontology fragment saved to: {out_path}[/green]")
+        outcome = await self.process_cq(cq, basename, cq_index=-1, top_k=top_k, story=story)
+        if outcome.success:
             print("\n[bold green]Ontology fragment[/bold green]\n")
-            print(fragment)
-        else:
-            print("[bold yellow]Generated fragment failed Turtle validation[/bold yellow]")
-            print(fragment)
-        after = self.tracker.snapshot()
-        self.logger.log_cost_row(-1, cq, self.tracker.diff(before, after))
+            print(self.fragments[-1][1])
+            self.finalize(f"single_{onto_tag}")
         print(f"[bold green]💲 Estimated total API cost (USD): {self.tracker.totals_cost_usd():.6f}[/bold green]")
 
     async def run_csv(self, csv_file: str, ontology_files: List[str], limit: Optional[int] = None, top_k: int = 20) -> None:
@@ -1002,10 +1508,9 @@ class OntologyRAG:
             df = df.head(limit)
             print(f"[blue]Processing limited to first {len(df)} rows[/blue]")
 
-        prefix_block = await self._build_store(ontology_files)
+        await self.prepare(ontology_files)
         onto_tag = self._core_tag(ontology_files)
 
-        fragments: List[Tuple[str, str]] = []
         successful = 0
         failed = 0
         start_time = time.time()
@@ -1015,74 +1520,25 @@ class OntologyRAG:
 
         for seq_num, (idx, row) in enumerate(df.iterrows(), start=1):
             cq = str(row['CQ']).strip()
-            before = self.tracker.snapshot()
-
             if not cq or cq.lower() in ['nan', 'none', '']:
                 print(f"[yellow]Row {idx}: Empty CQ, skipping[/yellow]")
                 self.logger.log_processing_result(idx, cq, False, 0, {}, 0, "Empty CQ")
                 failed += 1
                 pbar.update(1)
                 continue
-
             pbar.set_description(f"Processing CQ {idx}")
-            cq_start = time.time()
-            cq_identifier = self._extract_cq_id(row)
-            basename = self._build_cq_basename(cq_identifier, seq_num, onto_tag)
-
-            relevant: List[OntologyElement] = []
-            src_counts: Dict[str, int] = {}
-
-            try:
-                relevant = await self._retrieve_relevant(cq, k=top_k)
-                self._write_retrieved_elements(basename, relevant)
-                for el in relevant:
-                    src_counts[Path(el.source_ontology).stem] = src_counts.get(Path(el.source_ontology).stem, 0) + 1
-
-                fragment = await self._generate_fragment(cq, relevant, prefix_block)
-                PropertyConstraintValidator.ensure_domain_range(fragment)
-
-                if TurtleValidator.validate_ttl(fragment):
-                    fragments.append((cq, fragment))
-                    out_file = self.paths.individual_dir / f"{basename}.ttl"
-                    out_file.write_text(fragment, encoding="utf-8")
-                    await self._index_additional_files([str(out_file)], origin="session")
-                    self.logger.log_processing_result(idx, cq, True, len(relevant), src_counts, time.time() - cq_start)
-                    successful += 1
-                    print(f"[green]CQ {idx} processed successfully[/green]")
-                else:
-                    print(f"[red]CQ {idx}: Generated invalid Turtle[/red]")
-                    self.logger.log_processing_result(idx, cq, False, len(relevant), src_counts, time.time() - cq_start, "Invalid Turtle")
-                    failed += 1
-            except ValueError as err:
-                print(f"[red]{err}[/red]")
-                self.logger.log_processing_result(idx, cq, False, len(relevant), src_counts, time.time() - cq_start, str(err))
-                failed += 1
-            except Exception as e:
-                print(f"[red]CQ {idx} failed: {e}[/red]")
-                self.logger.log_processing_result(idx, cq, False, 0, {}, time.time() - cq_start, str(e))
-                failed += 1
-            finally:
-                after = self.tracker.snapshot()
-                self.logger.log_cost_row(idx, cq, self.tracker.diff(before, after))
-                pbar.update(1)
-                await asyncio.sleep(0.1)
+            basename = self._build_cq_basename(self._extract_cq_id(row), seq_num, onto_tag)
+            chunk_id = str(row["chunk_id"]) if "chunk_id" in row and pd.notna(row["chunk_id"]) else None
+            outcome = await self.process_cq(cq, basename, cq_index=idx, top_k=top_k,
+                                            story=self._extract_story(row), chunk_id=chunk_id)
+            successful += int(outcome.success)
+            failed += int(not outcome.success)
+            pbar.update(1)
+            await asyncio.sleep(0.1)
 
         pbar.close()
 
-        if fragments:
-            print(f"[yellow]Combining {len(fragments)} ontology fragments...[/yellow]")
-            combined = OntologyCombiner.combine(fragments, ontology_files, prefix_block)
-            combined_basename = f"{Path(csv_file).stem}_{onto_tag}"
-            combined_path = self.paths.cache_dir / f"{combined_basename}_combined.ttl"
-            combined_path.write_text(combined, encoding="utf-8")
-            print(f"[green]Combined ontology saved to: {combined_path}[/green]")
-            if TurtleValidator.validate_ttl(combined):
-                print("[green]Combined ontology is syntactically valid[/green]")
-            else:
-                print("[yellow]Combined ontology has syntax issues[/yellow]")
-        else:
-            combined_path = self.paths.combined_ttl
-
+        combined_path = self.finalize(f"{Path(csv_file).stem}_{onto_tag}") or self.paths.combined_ttl
         total_time = time.time() - start_time
         self.logger.log_final_results(len(df), successful, failed, total_time, str(combined_path))
 
@@ -1090,7 +1546,88 @@ class OntologyRAG:
         print(f"Total CQs: {len(df)}")
         print(f"Successful: {successful}")
         print(f"Failed: {failed}")
-        print(f"Success rate: {(successful / len(df) * 100):.1f}%")
+        if len(df):
+            print(f"Success rate: {(successful / len(df) * 100):.1f}%")
+        print(f"[bold green]💲 Estimated total API cost (USD): {self.tracker.totals_cost_usd():.6f}[/bold green]")
+
+
+    async def run_document(self, doc_file: str, ontology_files: List[str], *, top_k: int = 20,
+                           max_tokens: int = 400, overlap_tokens: int = 0, rechunk: bool = False,
+                           max_cqs: int = 5, dedup_threshold: float = 0.92, require_evidence: bool = True,
+                           use_story: bool = True, cq_only: bool = False, limit_chunks: Optional[int] = None) -> None:
+        """Parsed document -> chunks -> CQs per chunk -> incremental ontology extension.
+
+        Chunks are processed in document order; each chunk's CQs are generated and then
+        immediately used to extend the working ontology, so later chunks can reuse what
+        earlier chunks introduced."""
+        def count(text: str) -> int:
+            try:
+                return len(ENC.encode(text))
+            except Exception:
+                return doc_pipeline.approx_tokens(text)
+
+        chunks = doc_pipeline.load_chunks(doc_file, max_tokens=max_tokens, overlap_tokens=overlap_tokens,
+                                          rechunk=rechunk, count=count)
+        if limit_chunks:
+            chunks = chunks[:limit_chunks]
+        doc_pipeline.write_chunks_jsonl(chunks, self.paths.cache_dir / "chunks.jsonl")
+        print(f"[bold blue]Document {doc_file}: {len(chunks)} chunks[/bold blue]")
+
+        if not cq_only:
+            await self.prepare(ontology_files)
+        gen = doc_pipeline.CQGenerator(self.llm, self.embedder, max_cqs=max_cqs, dedup_threshold=dedup_threshold,
+                                       require_evidence=require_evidence, doc_title=Path(doc_file).stem)
+        onto_tag = self._core_tag(ontology_files)
+        cq_csv = self.paths.cache_dir / "generated_cqs.csv"
+        header = ["CQID", "CQ", "chunk_id", "chunk_order", "heading", "evidence", "type", "status",
+                  "duplicate_of", "similarity", "extension_success", "new_elements", "changed_elements", "Story"]
+        with cq_csv.open("w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerow(header)
+
+        stats = {"chunks": len(chunks), "candidates": 0, "kept": 0, "duplicate": 0, "ungrounded": 0,
+                 "extended_ok": 0, "extended_failed": 0}
+        start_time = time.time()
+        seq = 0
+        for chunk in chunks:
+            before = self.tracker.snapshot()
+            try:
+                candidates = await gen.generate(chunk)
+            except Exception as e:
+                print(f"[red]Chunk {chunk.chunk_id}: CQ generation failed: {e}[/red]")
+                candidates = []
+            self.logger.log_cost_row(f"{chunk.chunk_id}:cqgen", chunk.text[:200], self.tracker.diff(before, self.tracker.snapshot()))
+            story = chunk.context_text() if use_story else None
+            print(f"[cyan]Chunk {chunk.chunk_id} ({' > '.join(chunk.heading_path)}): "
+                  f"{sum(c.status == 'kept' for c in candidates)}/{len(candidates)} CQs kept[/cyan]")
+            for c in candidates:
+                stats["candidates"] += 1
+                stats[c.status] = stats.get(c.status, 0) + 1
+                ok, new_n, chg_n = "", "", ""
+                if c.status == "kept" and not cq_only:
+                    seq += 1
+                    basename = self._build_cq_basename(c.cq_id, seq, onto_tag)
+                    outcome = await self.process_cq(c.cq, basename, cq_index=c.cq_id, top_k=top_k,
+                                                    story=story, chunk_id=chunk.chunk_id)
+                    ok, new_n, chg_n = outcome.success, outcome.new_elements, outcome.changed_elements
+                    stats["extended_ok" if outcome.success else "extended_failed"] += 1
+                with cq_csv.open("a", newline="", encoding="utf-8") as fh:
+                    csv.writer(fh).writerow([
+                        c.cq_id, c.cq, c.chunk_id, chunk.order, " > ".join(chunk.heading_path), c.evidence,
+                        c.cq_type, c.status, c.duplicate_of, f"{c.similarity:.4f}", ok, new_n, chg_n,
+                        chunk.context_text(),
+                    ])
+
+        combined_path: Optional[Path] = None
+        if not cq_only:
+            combined_path = self.finalize(f"{self._sanitize_token(Path(doc_file).stem, 'doc')}_{onto_tag}")
+            self.logger.log_final_results(stats["kept"], stats["extended_ok"], stats["extended_failed"],
+                                          time.time() - start_time, str(combined_path or ""))
+        (self.paths.cache_dir / "document_run_summary.json").write_text(
+            json.dumps({**stats, "document": doc_file, "reference_ontologies": ontology_files,
+                                      "base_iri": self.base_iri, "output": str(combined_path or "")}, indent=2),
+            encoding="utf-8")
+        print(f"\n[bold green]Document processing complete[/bold green]: {stats}")
+        print(f"CQs written to {cq_csv}")
         print(f"[bold green]💲 Estimated total API cost (USD): {self.tracker.totals_cost_usd():.6f}[/bold green]")
 
 
@@ -1118,50 +1655,81 @@ def expand_onto_args(files: Optional[List[str]], dirs: Optional[List[str]]) -> L
             result.append(f)
             seen.add(f)
     if not result:
-        print("[red]No ontology files found from --onto/--onto-dir[/red]")
-        sys.exit(1)
+        if files or dirs:
+            print("[red]No ontology files found from --onto/--onto-dir[/red]")
+            sys.exit(1)
+        print("[yellow]No --onto/--onto-dir given: starting from an empty ontology[/yellow]")
     return result
 
 
+def _add_common(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--onto", nargs="+", help="Reference/base ontology files (.ttl/.owl). Omit both --onto and --onto-dir to start from an empty ontology.")
+    sp.add_argument("--onto-dir", nargs="+", help="One or more directories to scan for .ttl/.owl")
+    sp.add_argument("--top-k", type=int, default=20, help="Top-K elements to retrieve")
+    sp.add_argument("--include-cache", action="store_true", help="Also reuse previously generated CQ fragments from cache")
+    sp.add_argument("--run-dir", default=None, help="Directory for logs, fragments and combined output (default: ~/.core_ontology_rag_cache). Use a fresh one per experiment run.")
+    sp.add_argument("--base-iri", default=None, help=f"Namespace bound to ':' for NEW elements (prompt asks the LLM to put new elements there). Default: the reference ontology's default namespace, or {DEFAULT_BASE_IRI} when there is none.")
+    sp.add_argument("--max-retries", type=int, default=0, help="Self-correction: re-prompt the LLM with the validation error up to N times (default 0 = original behaviour)")
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Core ontology RAG for CQ → TTL (tidied)")
+    p = argparse.ArgumentParser(description="OntoExtend: CQ / document -> ontology extension via RAG")
     sub = p.add_subparsers(dest="cmd")
+
+    p_doc = sub.add_parser("doc", help="Parsed document -> chunks -> CQs per chunk -> ontology extension")
+    p_doc.add_argument("--file", required=True, help="Parsed document (.md, .txt, .json, .jsonl)")
+    _add_common(p_doc)
+    p_doc.add_argument("--chunk-tokens", type=int, default=400, help="Max tokens per chunk (default 400)")
+    p_doc.add_argument("--chunk-overlap", type=int, default=0, help="Tokens of trailing paragraphs repeated in the next chunk")
+    p_doc.add_argument("--rechunk", action="store_true", help="Ignore chunk boundaries in JSON input and re-chunk the concatenated text")
+    p_doc.add_argument("--max-cqs", type=int, default=5, help="Max CQs per chunk (default 5)")
+    p_doc.add_argument("--dedup-threshold", type=float, default=0.92, help="Cosine similarity above which a CQ counts as a duplicate of an earlier one")
+    p_doc.add_argument("--keep-ungrounded", action="store_true", help="Keep CQs whose evidence quote is not found in the chunk")
+    p_doc.add_argument("--no-story", action="store_true", help="Do not pass the chunk text to the extension prompt as ONTOLOGY STORY")
+    p_doc.add_argument("--cq-only", action="store_true", help="Only chunk and generate CQs (writes generated_cqs.csv), no extension")
+    p_doc.add_argument("--limit-chunks", type=int, default=None, help="Process only the first N chunks")
 
     p_single = sub.add_parser("cq", help="Generate ontology for a single CQ")
     p_single.add_argument("--cq", required=True, help="Competency Question text")
-    p_single.add_argument("--onto", nargs="+", help="One or more reference ontology files (.ttl/.owl)")
-    p_single.add_argument("--onto-dir", nargs="+", help="One or more directories to scan for .ttl/.owl")
-    p_single.add_argument("--top-k", type=int, default=20, help="Top-K elements to retrieve")
-    p_single.add_argument("--include-cache", action="store_true", help="Also reuse previously generated CQ fragments from cache")
+    p_single.add_argument("--story", default=None, help="Optional ontology story / source text for the CQ")
+    _add_common(p_single)
 
     p_batch = sub.add_parser("csv", help="Process a CSV with a CQ column")
-    p_batch.add_argument("--file", required=True, help="CSV file with column 'CQ'")
-    p_batch.add_argument("--onto", nargs="+", help="One or more reference ontology files (.ttl/.owl)")
-    p_batch.add_argument("--onto-dir", nargs="+", help="One or more directories to scan for .ttl/.owl")
+    p_batch.add_argument("--file", required=True, help="CSV file with column 'CQ' (optional: CQID, Story, chunk_id)")
     p_batch.add_argument("--limit", type=int, default=None, help="Process only first N rows")
-    p_batch.add_argument("--top-k", type=int, default=20, help="Top-K elements to retrieve")
-    p_batch.add_argument("--include-cache", action="store_true", help="Also reuse previously generated CQ fragments from cache")
+    _add_common(p_batch)
 
     return p.parse_args()
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    paths = Paths()
+    run_dir = getattr(args, "run_dir", None)
+    paths = Paths(Path(run_dir).expanduser()) if run_dir else Paths()
+    if run_dir:
+        print(f"[blue]Writing all outputs to run directory: {paths.cache_dir}[/blue]")
     app = OntologyRAG(paths)
 
     if not args.cmd:
-        print("[bold red]Usage:[/bold red] python tidied_rag_ontology.py cq --cq \"...\" --onto core.ttl more.ttl")
-        print("         python tidied_rag_ontology.py csv --file dataset.csv --onto core.ttl more.ttl [--limit 50]")
+        print("[bold red]Usage:[/bold red] python rag-ontoextend.py cq --cq \"...\" [--onto core.ttl ...]")
+        print("         python rag-ontoextend.py csv --file dataset.csv [--onto core.ttl ...] [--limit 50]")
+        print("         python rag-ontoextend.py doc --file parsed_doc.md [--onto-dir base/] [--base-iri IRI]")
         sys.exit(1)
 
+    app.include_cache = bool(getattr(args, "include_cache", False))
+    app.base_iri = args.base_iri
+    app.max_retries = max(0, args.max_retries)
+    ontofiles = expand_onto_args(args.onto, args.onto_dir)
     if args.cmd == "cq":
-        app.include_cache = bool(getattr(args, "include_cache", False))
-        ontofiles = expand_onto_args(args.onto, args.onto_dir)
-        await app.run_single_cq(args.cq, ontofiles, top_k=args.top_k)
+        await app.run_single_cq(args.cq, ontofiles, top_k=args.top_k, story=args.story)
     elif args.cmd == "csv":
-        app.include_cache = bool(getattr(args, "include_cache", False))
-        ontofiles = expand_onto_args(args.onto, args.onto_dir)
         await app.run_csv(args.file, ontofiles, limit=args.limit, top_k=args.top_k)
+    elif args.cmd == "doc":
+        await app.run_document(
+            args.file, ontofiles, top_k=args.top_k, max_tokens=args.chunk_tokens,
+            overlap_tokens=args.chunk_overlap, rechunk=args.rechunk, max_cqs=args.max_cqs,
+            dedup_threshold=args.dedup_threshold, require_evidence=not args.keep_ungrounded,
+            use_story=not args.no_story, cq_only=args.cq_only, limit_chunks=args.limit_chunks,
+        )
 
 
 def main() -> None:
