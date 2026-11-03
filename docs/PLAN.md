@@ -57,6 +57,11 @@
 - 섬유 CQ 13개 + OntoDESIDE로 원래 파이프라인 실행. 결과를 회귀 기준으로 보관.
 - EU-project / Industry CQ 세트 확보 (F10).
 
+**진행 상황 (2026-11-03)**
+- 완료: `LLM_TEMPERATURE`/`VECTOR_DIM` 형 변환, `--run-dir` 옵션(`cq`, `csv` 둘 다), `requirements.txt`의 openai·pandas 버전 수정, `scripts/run_baseline.sh`, 오프라인 스모크 테스트 `tests/smoke_offline.py`.
+- 스모크 테스트는 해시 임베더와 고정 응답 LLM으로 실제 `run_csv()`를 끝까지 돌린다. 섬유 CQ 13개 전부 통과, 출력이 `--run-dir`에만 쓰이는 것, `--include-cache` 없이도 앞 CQ 조각이 검색되는 것(F3)을 확인했다. 실행: `python tests/smoke_offline.py --limit 13`.
+- 남음: 실제 API 키로 `scripts/run_baseline.sh` 실행 (`.env`에 `OPENAI_API_KEY`, `LLM_TEMPERATURE=0`), EU-project/Industry CQ 세트 확보.
+
 ### 1단계: 평가 도구 (`eval/` 독립 스크립트)
 - `contracts.py`: CQ 계약 생성·검증·고정 (JSON).
 - `cq_eval.py`: 계약 → ABox + SPARQL 생성·실행, pass@k, 실패 유형 분류.

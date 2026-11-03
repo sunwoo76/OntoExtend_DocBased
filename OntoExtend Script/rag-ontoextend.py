@@ -30,11 +30,11 @@ load_dotenv()  # take environment variables from .env
 
 LLM_SERVICE = os.getenv("LLM_SERVICE", "openai")                    # openai or corporate
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
-LLM_TEMPERATURE = os.getenv("LLM_TEMPERATURE", 0.7)
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.7))  # env values are strings
 
 EMBEDDER = os.getenv("EMBEDDER", "openai")                          # openai or huggingface
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")    # embedding-3-small
-VECTOR_DIM = os.getenv("VECTOR_DIM", 1536)                              
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", 1536))                              
 
 ENC = get_encoding("cl100k_base")
 
@@ -1133,6 +1133,7 @@ def parse_args() -> argparse.Namespace:
     p_single.add_argument("--onto-dir", nargs="+", help="One or more directories to scan for .ttl/.owl")
     p_single.add_argument("--top-k", type=int, default=20, help="Top-K elements to retrieve")
     p_single.add_argument("--include-cache", action="store_true", help="Also reuse previously generated CQ fragments from cache")
+    p_single.add_argument("--run-dir", default=None, help="Directory for logs, fragments and combined output (default: ~/.core_ontology_rag_cache). Use a fresh one per experiment run.")
 
     p_batch = sub.add_parser("csv", help="Process a CSV with a CQ column")
     p_batch.add_argument("--file", required=True, help="CSV file with column 'CQ'")
@@ -1141,12 +1142,16 @@ def parse_args() -> argparse.Namespace:
     p_batch.add_argument("--limit", type=int, default=None, help="Process only first N rows")
     p_batch.add_argument("--top-k", type=int, default=20, help="Top-K elements to retrieve")
     p_batch.add_argument("--include-cache", action="store_true", help="Also reuse previously generated CQ fragments from cache")
+    p_batch.add_argument("--run-dir", default=None, help="Directory for logs, fragments and combined output (default: ~/.core_ontology_rag_cache). Use a fresh one per experiment run.")
 
     return p.parse_args()
 
 
 async def _main_async(args: argparse.Namespace) -> None:
-    paths = Paths()
+    run_dir = getattr(args, "run_dir", None)
+    paths = Paths(Path(run_dir).expanduser()) if run_dir else Paths()
+    if run_dir:
+        print(f"[blue]Writing all outputs to run directory: {paths.cache_dir}[/blue]")
     app = OntologyRAG(paths)
 
     if not args.cmd:
